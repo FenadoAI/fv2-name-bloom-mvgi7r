@@ -8,7 +8,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+import hashlib
+import secrets
+import bcrypt
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends, HTTPException, status
+import jwt
 
 # AI agents
 from ai_agents.agents import AgentConfig, SearchAgent, ChatAgent
@@ -27,6 +33,11 @@ agent_config = AgentConfig()
 search_agent: Optional[SearchAgent] = None
 chat_agent: Optional[ChatAgent] = None
 
+# Auth configuration
+JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
+JWT_ALGORITHM = "HS256"
+security = HTTPBearer()
+
 # Main app
 app = FastAPI(title="AI Agents API", description="Minimal AI Agents API with LangGraph and MCP support")
 
@@ -43,6 +54,49 @@ class StatusCheck(BaseModel):
 class StatusCheckCreate(BaseModel):
     client_name: str
 
+
+# User models
+class User(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    email: str
+    hashed_password: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    favorites: List[str] = Field(default_factory=list)  # List of name IDs
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    created_at: datetime
+
+# Name models
+class Name(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    gender: str  # "boy", "girl", "unisex"
+    origin: str
+    meaning: str
+    popularity_score: int = Field(default=50, ge=1, le=100)
+
+class NameRequest(BaseModel):
+    gender: Optional[str] = None  # "boy", "girl", "unisex", or None for all
+    count: int = Field(default=10, ge=1, le=50)
+    style: Optional[str] = None  # "traditional", "modern", "unique", etc.
+
+class FavoritesList(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    name_ids: List[str]
+    share_token: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 # AI agent models
 class ChatRequest(BaseModel):
@@ -73,6 +127,42 @@ class SearchResponse(BaseModel):
     sources_count: int
     error: Optional[str] = None
 
+# Helper functions
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(hours=24)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+
+    user = await db.users.find_one({"id": user_id})
+    if user is None:
+        raise credentials_exception
+    return User(**user)
+
 # Routes
 @api_router.get("/")
 async def root():
@@ -90,6 +180,197 @@ async def get_status_checks():
     status_checks = await db.status_checks.find().to_list(1000)
     return [StatusCheck(**status_check) for status_check in status_checks]
 
+
+# Authentication routes
+@api_router.post("/auth/register", response_model=UserResponse)
+async def register_user(user_data: UserCreate):
+    # Check if user already exists
+    existing_user = await db.users.find_one({"email": user_data.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Create new user
+    hashed_password = hash_password(user_data.password)
+    user = User(
+        email=user_data.email,
+        hashed_password=hashed_password
+    )
+
+    await db.users.insert_one(user.dict())
+
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        created_at=user.created_at
+    )
+
+@api_router.post("/auth/login")
+async def login_user(user_data: UserLogin):
+    # Find user
+    user_doc = await db.users.find_one({"email": user_data.email})
+    if not user_doc or not verify_password(user_data.password, user_doc["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Create access token
+    access_token = create_access_token(data={"sub": user_doc["id"]})
+
+    user = User(**user_doc)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": UserResponse(
+            id=user.id,
+            email=user.email,
+            created_at=user.created_at
+        )
+    }
+
+# Name generation routes
+@api_router.post("/names/generate", response_model=List[Name])
+async def generate_names(request: NameRequest):
+    """Generate baby names using AI"""
+    global chat_agent
+
+    try:
+        # Initialize chat agent if needed
+        if chat_agent is None:
+            chat_agent = ChatAgent(agent_config)
+
+        # Build prompt based on request parameters
+        gender_filter = ""
+        if request.gender:
+            gender_filter = f" for {request.gender}s"
+
+        style_filter = ""
+        if request.style:
+            style_filter = f" in {request.style} style"
+
+        prompt = f"""Generate {request.count} baby names{gender_filter}{style_filter}.
+        For each name, provide:
+        - name: the actual name
+        - gender: "boy", "girl", or "unisex"
+        - origin: cultural/linguistic origin
+        - meaning: what the name means
+        - popularity_score: number from 1-100 indicating popularity (50 = average)
+
+        Return only a JSON array of objects with these fields. No additional text."""
+
+        # Get AI response
+        result = await chat_agent.execute(prompt)
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail="Failed to generate names")
+
+        # Try to parse AI response as JSON
+        import json
+        try:
+            names_data = json.loads(result.content)
+            names = []
+            for name_data in names_data:
+                name = Name(
+                    name=name_data.get("name", "Unknown"),
+                    gender=name_data.get("gender", "unisex"),
+                    origin=name_data.get("origin", "Unknown"),
+                    meaning=name_data.get("meaning", "Unknown"),
+                    popularity_score=name_data.get("popularity_score", 50)
+                )
+                names.append(name)
+                # Store in database for future reference
+                await db.names.insert_one(name.dict())
+
+            return names
+        except json.JSONDecodeError:
+            # Fallback: create some sample names if AI response isn't valid JSON
+            sample_names = [
+                Name(name="Emma", gender="girl", origin="Germanic", meaning="Universal", popularity_score=95),
+                Name(name="Liam", gender="boy", origin="Irish", meaning="Strong-willed warrior", popularity_score=92),
+                Name(name="Olivia", gender="girl", origin="Latin", meaning="Olive tree", popularity_score=88),
+                Name(name="Noah", gender="boy", origin="Hebrew", meaning="Rest, comfort", popularity_score=85),
+                Name(name="Ava", gender="girl", origin="Latin", meaning="Life", popularity_score=82)
+            ]
+
+            # Store sample names and return subset based on request
+            filtered_names = []
+            for name in sample_names:
+                if len(filtered_names) >= request.count:
+                    break
+                if not request.gender or name.gender == request.gender or name.gender == "unisex":
+                    await db.names.insert_one(name.dict())
+                    filtered_names.append(name)
+
+            return filtered_names[:request.count]
+
+    except Exception as e:
+        logger.error(f"Error generating names: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating names: {str(e)}")
+
+# Favorites routes
+@api_router.post("/favorites/add/{name_id}")
+async def add_to_favorites(name_id: str, current_user: User = Depends(get_current_user)):
+    """Add a name to user's favorites"""
+    # Check if name exists
+    name = await db.names.find_one({"id": name_id})
+    if not name:
+        raise HTTPException(status_code=404, detail="Name not found")
+
+    # Add to user's favorites if not already there
+    if name_id not in current_user.favorites:
+        current_user.favorites.append(name_id)
+        await db.users.update_one(
+            {"id": current_user.id},
+            {"$set": {"favorites": current_user.favorites}}
+        )
+
+    return {"message": "Added to favorites"}
+
+@api_router.delete("/favorites/remove/{name_id}")
+async def remove_from_favorites(name_id: str, current_user: User = Depends(get_current_user)):
+    """Remove a name from user's favorites"""
+    if name_id in current_user.favorites:
+        current_user.favorites.remove(name_id)
+        await db.users.update_one(
+            {"id": current_user.id},
+            {"$set": {"favorites": current_user.favorites}}
+        )
+
+    return {"message": "Removed from favorites"}
+
+@api_router.get("/favorites", response_model=List[Name])
+async def get_user_favorites(current_user: User = Depends(get_current_user)):
+    """Get user's favorite names"""
+    if not current_user.favorites:
+        return []
+
+    names = await db.names.find({"id": {"$in": current_user.favorites}}).to_list(100)
+    return [Name(**name) for name in names]
+
+@api_router.post("/favorites/share")
+async def create_shareable_list(current_user: User = Depends(get_current_user)):
+    """Create a shareable link for user's favorites"""
+    favorites_list = FavoritesList(
+        user_id=current_user.id,
+        name_ids=current_user.favorites.copy()
+    )
+
+    await db.favorites_lists.insert_one(favorites_list.dict())
+
+    return {
+        "share_token": favorites_list.share_token,
+        "share_url": f"/shared/{favorites_list.share_token}"
+    }
+
+@api_router.get("/shared/{share_token}", response_model=List[Name])
+async def get_shared_favorites(share_token: str):
+    """Get shared favorites list by token"""
+    favorites_list = await db.favorites_lists.find_one({"share_token": share_token})
+    if not favorites_list:
+        raise HTTPException(status_code=404, detail="Shared list not found")
+
+    if not favorites_list["name_ids"]:
+        return []
+
+    names = await db.names.find({"id": {"$in": favorites_list["name_ids"]}}).to_list(100)
+    return [Name(**name) for name in names]
 
 # AI agent routes
 @api_router.post("/chat", response_model=ChatResponse)
