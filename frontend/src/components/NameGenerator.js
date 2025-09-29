@@ -6,14 +6,15 @@ import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Badge } from './ui/badge';
 import { Alert, AlertDescription } from './ui/alert';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
-import { Heart, RefreshCw, Share2, Copy, Sparkles, Filter } from 'lucide-react';
+import { Heart, RefreshCw, Share2, Copy, Sparkles, Filter, Image as ImageIcon, Loader2 } from 'lucide-react';
 import axios from 'axios';
 
 const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 const API = `${API_BASE}/api`;
 
-const NameCard = ({ name, onToggleFavorite, isFavorite, showActions = true }) => {
+const NameCard = ({ name, onToggleFavorite, isFavorite, showActions = true, onGenerateImage }) => {
   const { user } = useAuth();
+  const [generatingImage, setGeneratingImage] = useState(false);
 
   const getGenderColor = (gender) => {
     switch (gender) {
@@ -33,6 +34,19 @@ const NameCard = ({ name, onToggleFavorite, isFavorite, showActions = true }) =>
 
   const popularity = getPopularityLevel(name.popularity_score);
 
+  const handleGenerateImage = async () => {
+    if (!user || generatingImage) return;
+
+    setGeneratingImage(true);
+    try {
+      await onGenerateImage(name.id);
+    } catch (error) {
+      console.error('Error generating image:', error);
+    } finally {
+      setGeneratingImage(false);
+    }
+  };
+
   return (
     <Card className="h-full transition-all duration-200 hover:shadow-lg hover:scale-105">
       <CardHeader className="pb-3">
@@ -41,20 +55,49 @@ const NameCard = ({ name, onToggleFavorite, isFavorite, showActions = true }) =>
             {name.name}
           </CardTitle>
           {showActions && user && (
-            <Button
-              onClick={() => onToggleFavorite(name.id)}
-              variant="ghost"
-              size="sm"
-              className="p-1"
-            >
-              <Heart
-                className={`h-5 w-5 ${isFavorite ? 'fill-red-500 text-red-500' : 'text-gray-400'}`}
-              />
-            </Button>
+            <div className="flex space-x-1">
+              <Button
+                onClick={handleGenerateImage}
+                variant="ghost"
+                size="sm"
+                className="p-1"
+                disabled={generatingImage}
+                title="Generate image for this name"
+              >
+                {generatingImage ? (
+                  <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+                ) : (
+                  <ImageIcon className="h-4 w-4 text-gray-400 hover:text-indigo-500" />
+                )}
+              </Button>
+              <Button
+                onClick={() => onToggleFavorite(name.id)}
+                variant="ghost"
+                size="sm"
+                className="p-1"
+              >
+                <Heart
+                  className={`h-5 w-5 ${isFavorite ? 'fill-red-500 text-red-500' : 'text-gray-400'}`}
+                />
+              </Button>
+            </div>
           )}
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
+        {name.image_url && (
+          <div className="mb-4">
+            <img
+              src={name.image_url}
+              alt={`Artistic representation of the name ${name.name}`}
+              className="w-full h-40 object-cover rounded-lg shadow-sm"
+              onError={(e) => {
+                e.target.style.display = 'none';
+              }}
+            />
+          </div>
+        )}
+
         <div className="flex flex-wrap gap-2">
           <Badge variant="outline" className={getGenderColor(name.gender)}>
             {name.gender === 'unisex' ? 'Unisex' : name.gender.charAt(0).toUpperCase() + name.gender.slice(1)}
@@ -253,6 +296,44 @@ const NameGenerator = ({ showFavoritesOnly = false }) => {
     alert('Share link copied to clipboard!');
   };
 
+  const generateImage = async (nameId) => {
+    if (!user) return;
+
+    try {
+      const token = localStorage.getItem('token');
+      const response = await axios.post(`${API}/names/${nameId}/generate-image`, {}, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      if (response.data.success) {
+        // Update the name in the current list with the new image URL
+        setNames(prevNames =>
+          prevNames.map(name =>
+            name.id === nameId
+              ? { ...name, image_url: response.data.image_url }
+              : name
+          )
+        );
+
+        // Also update favorites if this name is in favorites
+        setFavorites(prevFavorites =>
+          prevFavorites.map(fav =>
+            fav.id === nameId
+              ? { ...fav, image_url: response.data.image_url }
+              : fav
+          )
+        );
+      } else {
+        setError(`Failed to generate image: ${response.data.error}`);
+      }
+    } catch (err) {
+      console.error('Error generating image:', err);
+      setError('Failed to generate image. Please try again.');
+    }
+  };
+
   const displayNames = showFavoritesOnly ? favorites : names;
 
   return (
@@ -327,6 +408,7 @@ const NameGenerator = ({ showFavoritesOnly = false }) => {
             onToggleFavorite={toggleFavorite}
             isFavorite={favorites.some(fav => fav.id === name.id)}
             showActions={!showFavoritesOnly || user}
+            onGenerateImage={generateImage}
           />
         ))}
       </div>

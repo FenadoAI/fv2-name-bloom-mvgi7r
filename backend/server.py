@@ -84,6 +84,7 @@ class Name(BaseModel):
     origin: str
     meaning: str
     popularity_score: int = Field(default=50, ge=1, le=100)
+    image_url: Optional[str] = None
 
 class NameRequest(BaseModel):
     gender: Optional[str] = None  # "boy", "girl", "unisex", or None for all
@@ -125,6 +126,14 @@ class SearchResponse(BaseModel):
     summary: str
     search_results: Optional[dict] = None
     sources_count: int
+    error: Optional[str] = None
+
+class ImageGenerationRequest(BaseModel):
+    name_id: str
+
+class ImageGenerationResponse(BaseModel):
+    success: bool
+    image_url: Optional[str] = None
     error: Optional[str] = None
 
 # Helper functions
@@ -303,6 +312,92 @@ async def generate_names(request: NameRequest):
     except Exception as e:
         logger.error(f"Error generating names: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating names: {str(e)}")
+
+@api_router.post("/names/{name_id}/generate-image", response_model=ImageGenerationResponse)
+async def generate_name_image(name_id: str, current_user: User = Depends(get_current_user)):
+    """Generate an artistic image for a given name"""
+    try:
+        # Get the name from database
+        name_doc = await db.names.find_one({"id": name_id})
+        if not name_doc:
+            raise HTTPException(status_code=404, detail="Name not found")
+
+        name_obj = Name(**name_doc)
+
+        # Create a descriptive prompt for the name
+        gender_desc = "baby boy" if name_obj.gender == "boy" else "baby girl" if name_obj.gender == "girl" else "baby"
+        prompt = f"Beautiful artistic illustration of the name '{name_obj.name}' written in elegant calligraphy, surrounded by soft pastel colors and gentle nature elements like flowers, stars, or clouds, perfect for a {gender_desc} nursery decoration. The name should be the focal point with beautiful typography, dreamy and peaceful atmosphere, soft lighting, watercolor style"
+
+        # Use chat agent to generate image through MCP
+        global chat_agent
+        if chat_agent is None:
+            chat_agent = ChatAgent(agent_config)
+
+        # Create a prompt that instructs the agent to generate an image
+        image_prompt = f"""Please generate an image with this description: {prompt}
+
+        Use the image generation tool to create this image. Return only the image URL from the result."""
+
+        result = await chat_agent.execute(image_prompt, use_tools=True)
+
+        if result.success and result.content:
+            # Try to extract URL from the response
+            content = result.content.strip()
+
+            # Look for URL patterns in the response
+            import re
+            url_patterns = [
+                r'https://[^\s<>"\']+\.(?:jpg|jpeg|png|gif|webp|svg)',
+                r'https://storage\.googleapis\.com/[^\s<>"\']+',
+                r'"url"\s*:\s*"([^"]+)"',
+                r"'url'\s*:\s*'([^']+)'"
+            ]
+
+            image_url = None
+            for pattern in url_patterns:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                if matches:
+                    image_url = matches[0] if isinstance(matches[0], str) else matches[0][0]
+                    break
+
+            # If no URL found, try to parse as JSON
+            if not image_url:
+                try:
+                    import json
+                    json_data = json.loads(content)
+                    if isinstance(json_data, dict) and 'url' in json_data:
+                        image_url = json_data['url']
+                except:
+                    pass
+
+            if image_url:
+                # Update name with image URL in database
+                await db.names.update_one(
+                    {"id": name_id},
+                    {"$set": {"image_url": image_url}}
+                )
+
+                return ImageGenerationResponse(
+                    success=True,
+                    image_url=image_url
+                )
+            else:
+                return ImageGenerationResponse(
+                    success=False,
+                    error=f"Could not extract image URL from response: {content}"
+                )
+        else:
+            return ImageGenerationResponse(
+                success=False,
+                error=result.error or "Image generation failed"
+            )
+
+    except Exception as e:
+        logger.error(f"Error generating image for name {name_id}: {e}")
+        return ImageGenerationResponse(
+            success=False,
+            error=f"Error generating image: {str(e)}"
+        )
 
 # Favorites routes
 @api_router.post("/favorites/add/{name_id}")
